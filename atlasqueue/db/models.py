@@ -7,7 +7,12 @@ Defines:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    """Return current UTC datetime (used as Python-side column default)."""
+    return datetime.now(tz=timezone.utc)
 
 from sqlalchemy import (
     DateTime,
@@ -49,6 +54,7 @@ class Job(Base):
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
+        insert_default=uuid.uuid4,
     )
     type: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
@@ -69,6 +75,7 @@ class Job(Base):
     run_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
+        default=_utcnow,
         server_default=func.now(),
     )
     locked_until: Mapped[datetime | None] = mapped_column(
@@ -83,13 +90,15 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
+        default=_utcnow,
         server_default=func.now(),
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
+        default=_utcnow,
         server_default=func.now(),
-        onupdate=func.now(),
+        onupdate=_utcnow,
     )
 
     # Relationships
