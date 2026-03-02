@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from atlasqueue.core.enums import JobStatus
 from atlasqueue.core.logging import get_logger
+from atlasqueue.core.metrics import LEASE_ACQUIRED, LEASE_REJECTED
 from atlasqueue.db.models import Job
 
 _log = get_logger(__name__)
@@ -101,6 +102,7 @@ async def acquire_lease(
     job: Job | None = result.one_or_none()
 
     if job is not None:
+        LEASE_ACQUIRED.inc()
         _log.info(
             "lease_acquired",
             job_id=str(job.id),
@@ -110,6 +112,7 @@ async def acquire_lease(
             worker_id=worker_id,
         )
     else:
+        LEASE_REJECTED.inc()
         _log.warning(
             "lease_not_acquired",
             job_id=str(job_id),

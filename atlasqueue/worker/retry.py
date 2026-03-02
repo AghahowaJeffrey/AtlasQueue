@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atlasqueue.core.config import Settings
 from atlasqueue.core.enums import JobStatus
 from atlasqueue.core.logging import get_logger
+from atlasqueue.core.metrics import JOBS_RETRIED
 from atlasqueue.db.models import Job
 
 _log = get_logger(__name__)
@@ -102,6 +103,7 @@ async def sweep_failed_jobs(
         # row lock so no other sweeper will pick these up simultaneously).
         for job_id in due_ids:
             await redis.lpush(settings.job_queue_key, str(job_id))
+            JOBS_RETRIED.inc()
             _log.info("retry_requeued", job_id=str(job_id))
 
         # Step 3 — Bulk UPDATE to queued now that Redis entries are written.

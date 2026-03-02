@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # ── Worker ──────────────────────────────────────────────────────────────
     worker_lease_seconds: int = 30
     worker_poll_timeout: int = 5  # seconds, used for BLPOP blocking timeout
+    worker_metrics_port: int = 9091  # Prometheus sidecar HTTP port
 
     # ── Retry policy (matches PRD §9) ───────────────────────────────────────
     retry_base_delay_seconds: int = 5

@@ -21,6 +21,7 @@ This surfaces configuration problems quickly rather than silently dropping jobs.
 """
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -31,6 +32,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atlasqueue.core.config import Settings, get_settings
 from atlasqueue.core.enums import JobStatus
 from atlasqueue.core.logging import get_logger
+from atlasqueue.core.metrics import (
+    JOBS_DEAD,
+    JOBS_FAILED,
+    JOBS_SUCCEEDED,
+    JOB_DURATION,
+    WORKER_ACTIVE_JOBS,
+)
 from atlasqueue.db.models import Job
 from atlasqueue.worker.handlers import get_handler
 from atlasqueue.worker.retry import compute_backoff
@@ -156,6 +164,8 @@ async def execute_job(
     handler = get_handler(job.type)
 
     error: str | None = None
+    WORKER_ACTIVE_JOBS.inc()
+    t_start = time.perf_counter()
     try:
         if handler is None:
             raise HandlerNotFound(
@@ -180,12 +190,23 @@ async def execute_job(
             job_type=job.type,
             error=error,
         )
+    finally:
+        WORKER_ACTIVE_JOBS.dec()
 
-    # ── Status transition ─────────────────────────────────────────────────
+    # ── Status transition + metrics ────────────────────────────────────
+    duration = time.perf_counter() - t_start
     async with session.begin():
         if error is None:
+            outcome = "succeeded"
             await _set_succeeded(session, job.id)
+            JOBS_SUCCEEDED.labels(job_type=job.type).inc()
         elif job.attempts >= job.max_attempts:
+            outcome = "dead"
             await _set_dead(session, redis, job, error, cfg)
+            JOBS_DEAD.labels(job_type=job.type).inc()
         else:
+            outcome = "failed"
             await _set_failed(session, job, error, cfg)
+            JOBS_FAILED.labels(job_type=job.type).inc()
+
+    JOB_DURATION.labels(job_type=job.type, outcome=outcome).observe(duration)

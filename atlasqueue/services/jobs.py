@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atlasqueue.core.config import get_settings
 from atlasqueue.core.enums import JobStatus
 from atlasqueue.core.logging import get_logger
+from atlasqueue.core.metrics import JOBS_IDEMPOTENT, JOBS_SUBMITTED
 from atlasqueue.db.models import IdempotencyKey, Job
 
 _settings = get_settings()
@@ -67,6 +68,7 @@ async def submit_job(
                 idempotency_key=idempotency_key,
                 existing_job_id=str(existing_key.job_id),
             )
+            JOBS_IDEMPOTENT.labels(job_type=job_type).inc()
             created = False
         else:
             # 2. Atomically create job + idempotency record.
@@ -100,6 +102,7 @@ async def submit_job(
     if created:
         await redis.lpush(_settings.job_queue_key, str(job.id))
         _log.info("job_enqueued", job_id=str(job.id), queue=_settings.job_queue_key)
+        JOBS_SUBMITTED.labels(job_type=job_type).inc()
 
     return job, created  # type: ignore[return-value]
 
