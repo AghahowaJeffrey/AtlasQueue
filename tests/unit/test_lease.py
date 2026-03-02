@@ -121,15 +121,14 @@ class TestAcquireLease:
         """_process_job_id must handle an unparseable Redis value without crashing."""
         from atlasqueue.worker.consumer import _process_job_id
 
-        # Patch the session factory so no real DB call is made.
         with patch("atlasqueue.worker.consumer._session_factory") as mock_factory:
             mock_factory.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
             mock_factory.return_value.__aexit__ = AsyncMock(return_value=None)
 
-            # Should NOT raise — just log an error and return.
-            await _process_job_id("not-a-valid-uuid")
+            # Should NOT raise — logs error and returns.
+            await _process_job_id("not-a-valid-uuid", AsyncMock())
 
-        # If we reach here without exception, the test passes.
+        # Reaching here without exception is the assertion.
 
     async def test_process_job_id_with_valid_uuid_acquires_lease(self) -> None:
         """_process_job_id calls acquire_lease for a well-formed UUID."""
@@ -147,13 +146,14 @@ class TestAcquireLease:
         with (
             patch("atlasqueue.worker.consumer._session_factory") as mock_factory,
             patch("atlasqueue.worker.consumer.acquire_lease", new_callable=AsyncMock) as mock_acquire,
+            patch("atlasqueue.worker.consumer.execute_job", new_callable=AsyncMock),
         ):
-            # Session context manager
             mock_factory.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_factory.return_value.__aexit__ = AsyncMock(return_value=None)
             mock_acquire.return_value = mock_job
 
-            await _process_job_id(str(job_id))
+            redis_mock = AsyncMock()
+            await _process_job_id(str(job_id), redis_mock)
 
         mock_acquire.assert_called_once()
         _, call_job_id, *_ = mock_acquire.call_args.args

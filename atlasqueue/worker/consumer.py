@@ -1,20 +1,20 @@
-"""Worker Redis consumer — BLPOP polling loop + lease acquisition.
+"""Worker Redis consumer — BLPOP polling loop + lease acquisition + execution.
 
-Flow per received job
----------------------
+Full per-job flow
+-----------------
 1. BLPOP job_id from Redis.
-2. Parse UUID; malformed → warn + skip (defensive).
-3. Open a DB session and call ``acquire_lease()``:
-   - UPDATE ... WHERE ... RETURNING — atomic, no TOCTOU race.
-   - If 0 rows updated → log warning, skip (already claimed / not claimable).
-   - If 1 row updated  → job is now ``status=running`` with a visibility
-     timeout (``locked_until``).
-4. TODO(M3): dispatch to handler registry; update status to succeeded/failed.
+2. Parse UUID; malformed → warn + skip.
+3. Open a DB session; call ``acquire_lease()`` (atomic UPDATE).
+   - 0 rows updated → skip (already claimed / not claimable).
+4. Open a second DB session; call ``execute_job()`` which:
+   - Runs the registered handler.
+   - Transitions status: succeeded | failed (with backoff run_at) | dead (+ DLQ).
+5. On BLPOP timeout → ``sweep_failed_jobs()`` re-enqueues due retries.
 
 Graceful shutdown
 -----------------
-SIGTERM / SIGINT set ``_SHUTDOWN`` which is checked between loop iterations.
-In-flight DB sessions complete their current work before the process exits.
+SIGTERM / SIGINT set ``_SHUTDOWN`` — checked between loop iterations.
+In-flight DB sessions complete the current operation before the process exits.
 """
 from __future__ import annotations
 
@@ -28,15 +28,16 @@ import redis.asyncio as aioredis
 from atlasqueue.core.config import get_settings
 from atlasqueue.core.logging import get_logger
 from atlasqueue.db.session import async_session as _session_factory
+from atlasqueue.worker.executor import execute_job
 from atlasqueue.worker.lease import acquire_lease
+from atlasqueue.worker.retry import sweep_failed_jobs
 
 _log = get_logger(__name__)
 _settings = get_settings()
 
 _SHUTDOWN = asyncio.Event()
 
-# Stable worker identity — survives restarts only if hostname is stable.
-# Recorded in jobs.lock_owner for observability / debugging.
+# Stable worker identity recorded in jobs.lock_owner for debuggability.
 _WORKER_ID: str = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
 
 
@@ -52,11 +53,11 @@ def _install_signal_handlers() -> None:
         loop.add_signal_handler(sig, _handle, sig)
 
 
-async def _process_job_id(raw_job_id: str) -> None:
-    """Attempt to acquire the lease for *raw_job_id* and log the outcome.
+async def _process_job_id(raw_job_id: str, redis_client: aioredis.Redis) -> None:
+    """Acquire lease for *raw_job_id* and execute the handler.
 
-    Isolated in its own coroutine so a DB error on one job does not crash
-    the whole polling loop.
+    Isolated in its own coroutine so a failure on one job cannot crash
+    the polling loop.
     """
     # ── Parse ─────────────────────────────────────────────────────────────
     try:
@@ -67,8 +68,9 @@ async def _process_job_id(raw_job_id: str) -> None:
 
     _log.info("job_received", job_id=str(job_id))
 
-    # ── Lease acquisition ─────────────────────────────────────────────────
     try:
+        # ── Lease acquisition (own session + transaction) ──────────────────
+        job = None
         async with _session_factory() as session:
             async with session.begin():
                 job = await acquire_lease(
@@ -79,9 +81,7 @@ async def _process_job_id(raw_job_id: str) -> None:
                 )
 
         if job is None:
-            # Not claimable: another worker won the race, or the job has
-            # already been processed / is scheduled for the future.
-            return
+            return  # acquire_lease already logged the reason
 
         _log.info(
             "job_claimed",
@@ -92,13 +92,13 @@ async def _process_job_id(raw_job_id: str) -> None:
             worker_id=_WORKER_ID,
         )
 
-        # TODO(M3): dispatch to handler registry, then:
-        #   On success → mark succeeded
-        #   On failure → mark failed / compute backoff / push to DLQ
+        # ── Handler execution (own session; executor manages its own begin()) ──
+        async with _session_factory() as session:
+            await execute_job(session, redis_client, job, _settings)
 
     except Exception as exc:  # noqa: BLE001
         _log.error(
-            "lease_error",
+            "job_processing_error",
             job_id=str(job_id),
             error=str(exc),
             exc_info=True,
@@ -120,19 +120,25 @@ async def run_forever(redis_client: aioredis.Redis) -> None:
 
     while not _SHUTDOWN.is_set():
         try:
-            # BLPOP returns (key, value) or None on timeout.
             result = await redis_client.blpop(queue_key, timeout=timeout)
         except (aioredis.RedisError, OSError) as exc:
             _log.error("redis_error", error=str(exc), exc_info=True)
-            await asyncio.sleep(1)  # back off briefly before retrying
+            await asyncio.sleep(1)
             continue
 
         if result is None:
+            # Sweep failed jobs whose run_at has arrived back onto the queue.
             _log.debug("no_jobs_waiting", queue=queue_key)
+            try:
+                async with _session_factory() as session:
+                    count = await sweep_failed_jobs(session, redis_client, _settings)
+                    if count:
+                        _log.info("sweep_requeued", count=count)
+            except Exception as exc:  # noqa: BLE001
+                _log.error("sweep_error", error=str(exc), exc_info=True)
             continue
 
         _, raw_job_id = result
-        await _process_job_id(raw_job_id)
+        await _process_job_id(raw_job_id, redis_client)
 
     _log.info("consumer_stopped")
-
